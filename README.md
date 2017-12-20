@@ -1,2 +1,2 @@
 # yqsync
-A Files Sync Tools
+A files sync tools
