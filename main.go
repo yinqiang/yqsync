@@ -6,9 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 )
 
@@ -153,22 +155,33 @@ func saveResult(cpName, delName string, cp, del filesMap) error {
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	cpuPprof := flag.String("pprof", "", "cpu profile")
+
 	src := flag.String("s", "src", "source folder")
 	dst := flag.String("d", "dst", "destination folder")
 	listOut := flag.Bool("l", false, "output compared list to file")
-	cpFileName := flag.String("-copyfile", "copy.txt", "name of copy files list")
-	delFileName := flag.String("-delfile", "del.txt", "name of delete files list")
+	cpFileName := flag.String("copyfile", "copy.txt", "name of copy files list")
+	delFileName := flag.String("delfile", "del.txt", "name of delete files list")
 	flag.Parse()
+
+	if len(*cpuPprof) > 0 {
+		f, e := os.Create(*cpuPprof)
+		if e != nil {
+			log.Fatal(e)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	cpM, delM, e := syncFolder(*src, *dst)
 	if e != nil {
-		fmt.Println(e.Error())
+		log.Fatal(e)
 		os.Exit(1)
 	}
 	if *listOut {
 		e = saveResult(*cpFileName, *delFileName, cpM, delM)
 		if e != nil {
-			fmt.Println(e.Error())
+			log.Fatal(e)
 			os.Exit(1)
 		}
 	}
