@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io/ioutil"
 	"log"
 	"os"
@@ -44,7 +45,8 @@ func (f fileInfos) Swap(i, j int) {
 type filesMap = map[string]fileInfo
 
 var (
-	quiet = flag.Bool("q", false, "no screen output")
+	quiet    = flag.Bool("q", false, "no screen output")
+	hashType = flag.String("hash", "md5", "hash type")
 )
 
 func isFolder(name string) (bool, error) {
@@ -100,9 +102,17 @@ func sameFile(f1, f2 string) bool {
 	if e != nil {
 		return false
 	}
-	h1 := md5.Sum(d1)
-	h2 := md5.Sum(d2)
-	return h1 == h2
+	switch *hashType {
+	case "md5":
+		h1 := md5.Sum(d1)
+		h2 := md5.Sum(d2)
+		return h1 == h2
+	case "crc32":
+		h1 := crc32.ChecksumIEEE(d1)
+		h2 := crc32.ChecksumIEEE(d2)
+		return h1 == h2
+	}
+	return false
 }
 
 func compareFolders(src, dst filesMap) (fileInfos, fileInfos) {
