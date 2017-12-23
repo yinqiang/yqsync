@@ -5,13 +5,13 @@ import (
 )
 
 func Test_SyncFolder(t *testing.T) {
-	if _, _, e := syncFolder("./src", "./dst"); e != nil {
+	if _, _, e := syncFolder("./src", "./dst", true); e != nil {
 		t.Fatalf(e.Error())
 	}
 }
 
 func Test_Output(t *testing.T) {
-	cp, del, e := syncFolder("./src", "./dst")
+	cp, del, e := syncFolder("./src", "./dst", true)
 	if e != nil {
 		t.Fatalf(e.Error())
 	}

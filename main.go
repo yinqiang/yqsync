@@ -11,6 +11,7 @@ import (
 	"path"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strings"
 )
 
@@ -19,8 +20,32 @@ type fileInfo struct {
 	Path string
 	Info os.FileInfo
 }
+type fileInfos []fileInfo
+
+func (f fileInfos) Len() int {
+	return len(f)
+}
+
+func (f fileInfos) Less(i, j int) bool {
+	if f[i].Info.IsDir() {
+		if !f[j].Info.IsDir() {
+			return true
+		}
+	} else if f[j].Info.IsDir() {
+		return false
+	}
+	return strings.Compare(f[i].Path, f[j].Path) < 0
+}
+
+func (f fileInfos) Swap(i, j int) {
+	f[i], f[j] = f[j], f[i]
+}
 
 type filesMap = map[string]fileInfo
+
+var (
+	quiet = flag.Bool("q", false, "no screen output")
+)
 
 func isFolder(name string) (bool, error) {
 	st, e := os.Stat(name)
@@ -30,7 +55,7 @@ func isFolder(name string) (bool, error) {
 	return st.IsDir(), nil
 }
 
-func scanFolder(folder, root string) ([]fileInfo, error) {
+func scanFolder(folder, root string) (fileInfos, error) {
 	fs, e := ioutil.ReadDir(folder)
 	if e != nil {
 		return nil, e
@@ -41,24 +66,24 @@ func scanFolder(folder, root string) ([]fileInfo, error) {
 		name := f.Name()
 		fName := path.Join(root, name)
 		fPath := path.Join(folder, name)
+		info := fileInfo{
+			Name: fName,
+			Path: fPath,
+			Info: f,
+		}
+		lt = append(lt, info)
 		if f.IsDir() {
 			subLt, e := scanFolder(fPath, fName)
 			if e != nil {
 				return nil, e
 			}
 			lt = append(lt, subLt...)
-		} else {
-			lt = append(lt, fileInfo{
-				Name: fName,
-				Path: fPath,
-				Info: f,
-			})
 		}
 	}
 	return lt, nil
 }
 
-func createMap(fs []fileInfo) filesMap {
+func createMap(fs fileInfos) filesMap {
 	m := filesMap{}
 	for _, f := range fs {
 		m[f.Name] = f
@@ -80,24 +105,65 @@ func sameFile(f1, f2 string) bool {
 	return h1 == h2
 }
 
-func compareFolders(src, dst filesMap) (filesMap, filesMap) {
-	cp := filesMap{}
-	del := filesMap{}
+func compareFolders(src, dst filesMap) (fileInfos, fileInfos) {
+	cp := fileInfos{}
+	del := fileInfos{}
 	for k, srcF := range src {
 		dstF, exisit := dst[k]
-		if !exisit || !sameFile(srcF.Path, dstF.Path) {
-			cp[k] = srcF
+		if srcF.Info.IsDir() {
+			if !exisit {
+				cp = append(cp, srcF)
+			}
+		} else if !exisit || !sameFile(srcF.Path, dstF.Path) {
+			cp = append(cp, srcF)
 		}
 	}
-	for k, f := range dst {
+	for _, f := range dst {
 		if _, exisit := src[f.Name]; !exisit {
-			del[k] = f
+			del = append(del, f)
 		}
 	}
+	sort.Sort(cp)
+	sort.Sort(sort.Reverse(del))
 	return cp, del
 }
 
-func syncFolder(src, dst string) (filesMap, filesMap, error) {
+func doCopy(dst string, cp fileInfos) error {
+	for _, f := range cp {
+		if f.Info.IsDir() {
+			if e := os.Mkdir(path.Join(dst, f.Name), f.Info.Mode()); e != nil {
+				return e
+			}
+		} else {
+			d, e := ioutil.ReadFile(f.Path)
+			if e != nil {
+				return e
+			}
+			e = ioutil.WriteFile(path.Join(dst, f.Name), d, f.Info.Mode())
+			if e != nil {
+				return e
+			}
+			if !*quiet {
+				log.Println("copy  ", f.Name)
+			}
+		}
+	}
+	return nil
+}
+
+func doDelete(del fileInfos) error {
+	for _, f := range del {
+		if e := os.Remove(f.Path); e != nil {
+			return e
+		}
+		if !*quiet {
+			log.Println("delete", f.Name)
+		}
+	}
+	return nil
+}
+
+func syncFolder(src, dst string, isTest bool) (fileInfos, fileInfos, error) {
 	ok, e := isFolder(src)
 	if e != nil {
 		return nil, nil, e
@@ -126,26 +192,36 @@ func syncFolder(src, dst string) (filesMap, filesMap, error) {
 	srcM := createMap(srcLt)
 	dstM := createMap(dstLt)
 
-	cpM, delM := compareFolders(srcM, dstM)
-	return cpM, delM, nil
+	cp, del := compareFolders(srcM, dstM)
+
+	if !isTest {
+		if e = doCopy(dst, cp); e != nil {
+			return nil, nil, e
+		}
+		if e = doDelete(del); e != nil {
+			return nil, nil, e
+		}
+	}
+
+	return cp, del, nil
 }
 
-func saveMap(name string, m filesMap) error {
+func save(name string, fs fileInfos) error {
 	l := []string{}
-	for _, f := range m {
+	for _, f := range fs {
 		l = append(l, f.Path)
 	}
-	s := strings.Join(l, "\n")
+	s := strings.Join(l, "\r\n") + "\r\n"
 	buf := bytes.NewBufferString(s)
 	return ioutil.WriteFile(name, buf.Bytes(), os.ModePerm)
 }
 
-func saveResult(cpName, delName string, cp, del filesMap) error {
-	e := saveMap(cpName, cp)
+func saveResult(cpName, delName string, cp, del fileInfos) error {
+	e := save(cpName, cp)
 	if e != nil {
 		return e
 	}
-	e = saveMap(delName, del)
+	e = save(delName, del)
 	if e != nil {
 		return e
 	}
@@ -155,13 +231,17 @@ func saveResult(cpName, delName string, cp, del filesMap) error {
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	isTest := flag.Bool("test", false, "is test mode, would not sync")
+
 	cpuPprof := flag.String("pprof", "", "cpu profile")
 
-	src := flag.String("s", "src", "source folder")
-	dst := flag.String("d", "dst", "destination folder")
+	src := flag.String("s", "./src", "source folder")
+	dst := flag.String("d", "./dst", "destination folder")
+
 	listOut := flag.Bool("l", false, "output compared list to file")
-	cpFileName := flag.String("copyfile", "copy.txt", "name of copy files list")
-	delFileName := flag.String("delfile", "del.txt", "name of delete files list")
+	cpFileName := flag.String("copyfile", "./copy.txt", "name of copy files list")
+	delFileName := flag.String("delfile", "./del.txt", "name of delete files list")
+
 	flag.Parse()
 
 	if len(*cpuPprof) > 0 {
@@ -173,13 +253,13 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	cpM, delM, e := syncFolder(*src, *dst)
+	cp, del, e := syncFolder(*src, *dst, *isTest)
 	if e != nil {
 		log.Fatal(e)
 		os.Exit(1)
 	}
 	if *listOut {
-		e = saveResult(*cpFileName, *delFileName, cpM, delM)
+		e = saveResult(*cpFileName, *delFileName, cp, del)
 		if e != nil {
 			log.Fatal(e)
 			os.Exit(1)
