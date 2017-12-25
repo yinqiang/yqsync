@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type fileInfo struct {
@@ -47,6 +49,8 @@ type filesMap = map[string]fileInfo
 var (
 	quiet    = flag.Bool("q", false, "no screen output")
 	hashType = flag.String("hash", "md5", "hash type")
+
+	maxProcs int
 )
 
 func isFolder(name string) (bool, error) {
@@ -93,48 +97,95 @@ func createMap(fs fileInfos) filesMap {
 	return m
 }
 
+func hashMd5(name string) string {
+	f, e := os.Open(name)
+	if e != nil {
+		panic(e)
+	}
+	m := md5.New()
+	if _, e = io.Copy(m, f); e != nil {
+		panic(e)
+	}
+	f.Close()
+	return fmt.Sprintf("%x", m.Sum(nil))
+}
+
+func hashCrc32(name string) uint32 {
+	f, e := os.Open(name)
+	if e != nil {
+		panic(e)
+	}
+	c := crc32.NewIEEE()
+	if _, e = io.Copy(c, f); e != nil {
+		panic(e)
+	}
+	f.Close()
+	return c.Sum32()
+}
+
 func sameFile(f1, f2 string) bool {
-	d1, e := ioutil.ReadFile(f1)
-	if e != nil {
-		return false
-	}
-	d2, e := ioutil.ReadFile(f2)
-	if e != nil {
-		return false
-	}
+	ret := false
 	switch *hashType {
 	case "md5":
-		h1 := md5.Sum(d1)
-		h2 := md5.Sum(d2)
-		return h1 == h2
+		h1 := hashMd5(f1)
+		h2 := hashMd5(f2)
+		ret = h1 == h2
 	case "crc32":
-		h1 := crc32.ChecksumIEEE(d1)
-		h2 := crc32.ChecksumIEEE(d2)
-		return h1 == h2
+		h1 := hashCrc32(f1)
+		h2 := hashCrc32(f2)
+		ret = h1 == h2
 	}
-	return false
+	return ret
+}
+
+func compareHash(srcF, dstF fileInfo, cpCh chan fileInfo, controlCh chan bool, wg *sync.WaitGroup) {
+	defer func() {
+		<-controlCh
+		wg.Done()
+	}()
+	wg.Add(1)
+	controlCh <- true
+	if !sameFile(srcF.Path, dstF.Path) {
+		cpCh <- srcF
+	}
 }
 
 func compareFolders(src, dst filesMap) (fileInfos, fileInfos) {
-	cp := fileInfos{}
-	del := fileInfos{}
-	for k, srcF := range src {
-		dstF, exisit := dst[k]
-		if srcF.Info.IsDir() {
-			if !exisit {
-				cp = append(cp, srcF)
+	controlCh := make(chan bool, maxProcs)
+	cpCh := make(chan fileInfo)
+	wg := sync.WaitGroup{}
+	go func(cpCh chan fileInfo, controlCh chan bool) {
+		for k, srcF := range src {
+			dstF, exisit := dst[k]
+			if srcF.Info.IsDir() {
+				if !exisit {
+					cpCh <- srcF
+				}
+			} else if !exisit {
+				cpCh <- srcF
+			} else {
+				go compareHash(srcF, dstF, cpCh, controlCh, &wg)
 			}
-		} else if !exisit || !sameFile(srcF.Path, dstF.Path) {
-			cp = append(cp, srcF)
 		}
+		wg.Wait()
+		close(controlCh)
+		close(cpCh)
+	}(cpCh, controlCh)
+
+	cp := fileInfos{}
+	for f := range cpCh {
+		cp = append(cp, f)
 	}
+	sort.Sort(cp)
+
+	del := fileInfos{}
 	for _, f := range dst {
 		if _, exisit := src[f.Name]; !exisit {
 			del = append(del, f)
 		}
 	}
-	sort.Sort(cp)
 	sort.Sort(sort.Reverse(del))
+
 	return cp, del
 }
 
@@ -145,16 +196,19 @@ func doCopy(dst string, cp fileInfos) error {
 				return e
 			}
 		} else {
-			d, e := ioutil.ReadFile(f.Path)
+			fsrc, e := os.Open(f.Path)
 			if e != nil {
 				return e
 			}
-			e = ioutil.WriteFile(path.Join(dst, f.Name), d, f.Info.Mode())
+			fdst, e := os.OpenFile(path.Join(dst, f.Name), os.O_CREATE|os.O_WRONLY, f.Info.Mode())
+			_, e = io.Copy(fdst, fsrc)
 			if e != nil {
 				return e
 			}
+			fsrc.Close()
+			fdst.Close()
 			if !*quiet {
-				log.Println("copy  ", f.Name)
+				log.Println("copy,", f.Name)
 			}
 		}
 	}
@@ -167,7 +221,7 @@ func doDelete(del fileInfos) error {
 			return e
 		}
 		if !*quiet {
-			log.Println("delete", f.Name)
+			log.Println("delete,", f.Name)
 		}
 	}
 	return nil
@@ -205,10 +259,10 @@ func syncFolder(src, dst string, isTest bool) (fileInfos, fileInfos, error) {
 	cp, del := compareFolders(srcM, dstM)
 
 	if !isTest {
-		if e = doCopy(dst, cp); e != nil {
+		if e = doDelete(del); e != nil {
 			return nil, nil, e
 		}
-		if e = doDelete(del); e != nil {
+		if e = doCopy(dst, cp); e != nil {
 			return nil, nil, e
 		}
 	}
@@ -239,7 +293,7 @@ func saveResult(cpName, delName string, cp, del fileInfos) error {
 }
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
+	maxProcs = runtime.GOMAXPROCS(runtime.NumCPU())
 
 	isTest := flag.Bool("test", false, "is test mode, would not sync")
 
