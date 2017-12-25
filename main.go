@@ -190,28 +190,39 @@ func compareFolders(src, dst filesMap) (fileInfos, fileInfos) {
 }
 
 func doCopy(dst string, cp fileInfos) error {
+	controlCh := make(chan bool, maxProcs)
+	wg := sync.WaitGroup{}
 	for _, f := range cp {
 		if f.Info.IsDir() {
 			if e := os.Mkdir(path.Join(dst, f.Name), f.Info.Mode()); e != nil {
 				return e
 			}
 		} else {
-			fsrc, e := os.Open(f.Path)
-			if e != nil {
-				return e
-			}
-			fdst, e := os.OpenFile(path.Join(dst, f.Name), os.O_CREATE|os.O_WRONLY, f.Info.Mode())
-			_, e = io.Copy(fdst, fsrc)
-			if e != nil {
-				return e
-			}
-			fsrc.Close()
-			fdst.Close()
+			go func(f fileInfo, wg *sync.WaitGroup) {
+				defer func() {
+					<-controlCh
+					wg.Done()
+				}()
+				wg.Add(1)
+				controlCh <- true
+				fsrc, e := os.Open(f.Path)
+				if e != nil {
+					panic(e)
+				}
+				fdst, e := os.OpenFile(path.Join(dst, f.Name), os.O_CREATE|os.O_WRONLY, f.Info.Mode())
+				_, e = io.Copy(fdst, fsrc)
+				if e != nil {
+					panic(e)
+				}
+				fsrc.Close()
+				fdst.Close()
+			}(f, &wg)
 			if !*quiet {
 				log.Println("copy,", f.Name)
 			}
 		}
 	}
+	wg.Wait()
 	return nil
 }
 
